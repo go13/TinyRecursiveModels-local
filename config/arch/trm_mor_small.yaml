@@ -1,0 +1,36 @@
+name: recursive_reasoning.trm_mor@TRM_MoR
+loss:
+  name: losses@MoRLossHead
+  loss_type: stablemax_cross_entropy
+  halt_margin: 1e-3
+  halt_loss_weight: 1.0
+  step_lambda: 1e-3
+
+# Worker (match trm_small scale)
+hidden_size: 256
+num_heads: 4
+expansion: 4
+L_layers: 2
+pos_encodings: rope
+mlp_t: True
+puzzle_emb_len: 12
+puzzle_emb_ndim: ${.hidden_size}
+
+# Planner / memory
+planner_size: 128
+mem_slots: 8
+mem_dim: 256
+use_planner: True
+use_memory: True
+use_film: True
+film_per_layer: False
+
+# Halting
+halt_max_steps: 12
+min_steps: 2
+
+# Training helpers
+checkpoint_worker: False
+bptt_steps: 0
+
+forward_dtype: bfloat16

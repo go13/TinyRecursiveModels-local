@@ -21,11 +21,11 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Activate virtual environment
-if [ -d ".venv" ]; then
-    source .venv/bin/activate
+# Resolve python from local venv (avoid hardcoded activate paths)
+if [ -x ".venv/bin/python" ]; then
+    PYTHON_BIN=".venv/bin/python"
 else
-    echo "Error: Virtual environment not found. Please run: uv venv .venv && source .venv/bin/activate && uv pip install -r requirements.txt"
+    echo "Error: Virtual environment not found or missing python. Please run: uv venv .venv && uv pip install -r requirements.txt"
     exit 1
 fi
 
@@ -62,7 +62,7 @@ export DISABLE_COMPILE="${DISABLE_COMPILE:-1}"
 
 # Default training parameters for smoke test (quick run)
 # Override by passing arguments like: epochs=1000 eval_interval=500
-python pretrain.py \
+"$PYTHON_BIN" pretrain.py \
     arch="$ARCH" \
     "data_paths=[${DATA_PATH}]" \
     global_batch_size=32 \

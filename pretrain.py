@@ -84,6 +84,7 @@ class PretrainConfig(pydantic.BaseModel):
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
+    device: Optional[str] = None  # "cuda", "cpu", or specific device like "cuda:0"
 
 @dataclass
 class TrainState:
@@ -96,7 +97,7 @@ class TrainState:
     total_steps: int
 
 
-def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
+def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, device: str, **kwargs):
     dataset = PuzzleDataset(PuzzleDatasetConfig(
         seed=config.seed,
         dataset_paths=config.data_paths_test if len(config.data_paths_test)>0 and split=="test" else config.data_paths,
@@ -104,18 +105,20 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
         num_replicas=world_size,
         **kwargs
     ), split=split)
-    dataloader = DataLoader(
-        dataset,
+    num_workers = 0 if device.startswith("cpu") else 1
+    dataloader_kwargs = dict(
         batch_size=None,
-        num_workers=1,
-        prefetch_factor=8,
-        pin_memory=True,
-        persistent_workers=True
+        num_workers=num_workers,
+        pin_memory=device.startswith("cuda"),
+        persistent_workers=num_workers > 0
     )
+    if num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = 8
+    dataloader = DataLoader(dataset, **dataloader_kwargs)
     return dataloader, dataset.metadata
 
 
-def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
+def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int, device: str):
     model_cfg = dict(
         **config.arch.__pydantic_extra__,  # type: ignore
         batch_size=config.global_batch_size // world_size,
@@ -129,7 +132,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     model_cls = load_model_class(config.arch.name)
     loss_head_cls = load_model_class(config.arch.loss.name)
 
-    with torch.device("cuda"):
+    with torch.device(device):
         model: nn.Module = model_cls(model_cfg)
         print(model)
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
@@ -138,7 +141,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
 
         # Load checkpoint
         if rank == 0:
-            load_checkpoint(model, config)
+            load_checkpoint(model, config, device)
 
         # Broadcast parameters from rank 0
         if world_size > 1:
@@ -216,12 +219,12 @@ def cosine_schedule_with_warmup_lr_lambda(
     return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
 
 
-def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
+def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int, device: str):
     # Estimated total training steps
     total_steps = int(config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
 
     # Model
-    model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size)
+    model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size, device=device)
 
     return TrainState(
         step=0,
@@ -243,12 +246,12 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
     torch.save(train_state.model.state_dict(), os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
 
 
-def load_checkpoint(model: nn.Module, config: PretrainConfig):
+def load_checkpoint(model: nn.Module, config: PretrainConfig, device: str):
     if config.load_checkpoint is not None:
         print(f"Loading checkpoint {config.load_checkpoint}")
 
         # Load state dict
-        state_dict = torch.load(config.load_checkpoint, map_location="cuda")
+        state_dict = torch.load(config.load_checkpoint, map_location=device)
 
         # Resize and reset puzzle emb if needed
         puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
@@ -288,17 +291,17 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
 
     return evaluators
 
-def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int, step_start_time: float = None):
+def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int, device: str, step_start_time: float = None):
     train_state.step += 1
     if train_state.step > train_state.total_steps:  # At most train_total_steps
         return
 
     # To device
-    batch = {k: v.cuda() for k, v in batch.items()}
+    batch = {k: v.to(device) for k, v in batch.items()}
 
     # Init carry if it is None
     if train_state.carry is None:
-        with torch.device("cuda"):
+        with torch.device(device):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
@@ -360,6 +363,7 @@ def evaluate(
     rank: int,
     world_size: int,
     cpu_group: Optional[dist.ProcessGroup],
+    device: str,
 ):
     reduced_metrics = None
 
@@ -406,8 +410,8 @@ def evaluate(
             total_samples += batch_size
 
             # To device
-            batch = {k: v.cuda() for k, v in batch.items()}
-            with torch.device("cuda"):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            with torch.device(device):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 
             # Forward
@@ -453,7 +457,7 @@ def evaluate(
                     sorted(metrics.keys())
                 )  # Sort keys to guarantee all processes use the same order.
                 metric_values = torch.zeros(
-                    (len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda"
+                    (len(set_ids), len(metrics.values())), dtype=torch.float32, device=device
                 )
 
             metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
@@ -593,6 +597,16 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
     return objects[0]  # type: ignore
 
 
+def resolve_device(config: PretrainConfig) -> str:
+    if config.device is None:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    requested = str(config.device)
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        print("Requested CUDA but no CUDA devices are available. Falling back to CPU.")
+        return "cpu"
+    return requested
+
+
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def launch(hydra_config: DictConfig):
     RANK = 0
@@ -602,12 +616,14 @@ def launch(hydra_config: DictConfig):
     # Initialize distributed training if in distributed environment (e.g. torchrun)
     if "LOCAL_RANK" in os.environ:
         # Initialize distributed, default device and dtype
-        dist.init_process_group(backend="nccl")
+        device_backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=device_backend)
 
         RANK = dist.get_rank()
         WORLD_SIZE = dist.get_world_size()
 
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        if device_backend == "nccl":
+            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         
         # CPU GLOO process group
         CPU_PROCESS_GROUP = dist.new_group(backend="gloo")
@@ -621,15 +637,19 @@ def launch(hydra_config: DictConfig):
     # Seed RNGs to ensure consistency
     torch.random.manual_seed(config.seed + RANK)
 
+    device = resolve_device(config)
+    if "LOCAL_RANK" in os.environ and device.startswith("cpu"):
+        raise RuntimeError("CPU training is not supported with torchrun in this script. Use single-process CPU instead.")
+
     # Dataset
     train_epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
     total_iters = config.epochs // train_epochs_per_iter
 
     assert config.epochs % train_epochs_per_iter == 0, "Eval interval must be a divisor of total epochs."
 
-    train_loader, train_metadata = create_dataloader(config, "train", test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+    train_loader, train_metadata = create_dataloader(config, "train", test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE, device=device)
     try:
-        eval_loader,  eval_metadata  = create_dataloader(config, "test", test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+        eval_loader,  eval_metadata  = create_dataloader(config, "test", test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE, device=device)
     except:
         print("NO EVAL DATA FOUND")
         eval_loader = eval_metadata = None
@@ -641,7 +661,7 @@ def launch(hydra_config: DictConfig):
         evaluators = []
 
     # Train state
-    train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
+    train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE, device=device)
 
     # Progress bar and logger
     progress_bar = None
@@ -663,8 +683,12 @@ def launch(hydra_config: DictConfig):
     for _iter_id in range(total_iters):
         current_epoch = _iter_id * train_epochs_per_iter
         if RANK == 0:
-            gpu_mem = torch.cuda.memory_allocated() / 1024**3
-            gpu_mem_max = torch.cuda.max_memory_allocated() / 1024**3
+            if device.startswith("cuda"):
+                gpu_mem = torch.cuda.memory_allocated() / 1024**3
+                gpu_mem_max = torch.cuda.max_memory_allocated() / 1024**3
+            else:
+                gpu_mem = 0.0
+                gpu_mem_max = 0.0
             print(f"\n{'='*60}")
             print(f"Epoch {current_epoch}/{config.epochs} (iter {_iter_id+1}/{total_iters})")
             print(f"Step {train_state.step}/{train_state.total_steps} | ~{batches_per_epoch} batches/epoch")
@@ -677,7 +701,7 @@ def launch(hydra_config: DictConfig):
         train_state.model.train()
         for set_name, batch, global_batch_size in train_loader:
             step_start_time = time.time()
-            metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, step_start_time=step_start_time)
+            metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, device=device, step_start_time=step_start_time)
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
@@ -719,7 +743,8 @@ def launch(hydra_config: DictConfig):
                 evaluators,
                 rank=RANK, 
                 world_size=WORLD_SIZE,
-                cpu_group=CPU_PROCESS_GROUP)
+                cpu_group=CPU_PROCESS_GROUP,
+                device=device)
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)

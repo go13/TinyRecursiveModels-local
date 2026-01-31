@@ -1,0 +1,32 @@
+name: recursive_reasoning.fiect@FIECT
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+# Iteration config
+max_iterations: 8
+min_iterations: 2
+halt_exploration_prob: 0.1
+
+# Architecture - balanced for performance
+num_layers: 2  # Deeper than IECT for better refinement
+hidden_size: 128
+num_heads: 4
+expansion: 4
+num_pred_heads: 3  # More heads for better ensemble
+
+# Memory and planner
+mem_slots: 4
+mem_dim: 64
+planner_size: 64
+use_film: true
+
+# Refinement dynamics
+residual_scale: 0.15
+confidence_temp: 1.0
+
+# Embeddings
+puzzle_emb_ndim: ${.hidden_size}
+puzzle_emb_len: 8
+
+forward_dtype: bfloat16

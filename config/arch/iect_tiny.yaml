@@ -1,0 +1,20 @@
+name: recursive_reasoning.iect@IterativeErrorCorrectingTransformer
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+# Iteration config - fewer iterations for speed
+max_iterations: 6
+halt_exploration_prob: 0.1
+
+# Smaller architecture for fast iteration
+num_layers: 1
+hidden_size: 128
+num_heads: 4
+expansion: 4
+num_pred_heads: 2  # Fewer heads for tiny
+
+puzzle_emb_ndim: ${.hidden_size}
+puzzle_emb_len: 8
+
+forward_dtype: bfloat16

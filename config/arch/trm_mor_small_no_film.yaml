@@ -1,0 +1,7 @@
+defaults:
+  - trm_mor_small
+  - _self_
+
+use_planner: True
+use_memory: True
+use_film: False
