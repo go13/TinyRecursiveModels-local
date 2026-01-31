@@ -1,11 +1,17 @@
 #!/bin/bash
 # Training script for TinyRecursiveModels
-# Usage: ./run_train.sh [data_path] [additional_args...]
+# Usage: ./run_train.sh [data_path] [arch] [additional_args...]
+#
+# Available architectures:
+#   trm       - Full model (512 hidden, ~7M params)
+#   trm_small - Small model (256 hidden, ~2M params)
+#   trm_tiny  - Tiny model (128 hidden, ~500K params) - fastest
 #
 # Examples:
-#   ./run_train.sh                                    # Use default test dataset
-#   ./run_train.sh data/sudoku-test-100-aug-10       # Specify dataset
-#   ./run_train.sh data/sudoku-test-100-aug-10 epochs=1000 eval_interval=500
+#   ./run_train.sh                                           # Use defaults (tiny model)
+#   ./run_train.sh data/sudoku-test-100-aug-10              # Specify dataset
+#   ./run_train.sh data/sudoku-test-100-aug-10 trm_small    # Use small model
+#   ./run_train.sh data/sudoku-test-100-aug-10 trm epochs=1000
 #
 # For multi-GPU training, use torchrun directly:
 #   torchrun --nproc-per-node 4 pretrain.py arch=trm data_paths="[data/your-dataset]"
@@ -23,9 +29,16 @@ else
     exit 1
 fi
 
-# Default dataset path
-DATA_PATH="${1:-data/sudoku-test-100-aug-10}"
-shift 2>/dev/null || true
+# Default dataset path and architecture
+DATA_PATH="${1:-data/sudoku-test-50-aug-5}"
+ARCH="${2:-trm_tiny}"
+shift 2 2>/dev/null || shift 1 2>/dev/null || true
+
+# Validate architecture - if it looks like a hydra override, treat as extra arg
+if [[ "$ARCH" == *"="* ]]; then
+    set -- "$ARCH" "$@"
+    ARCH="trm_tiny"
+fi
 
 # Check if dataset exists
 if [ ! -d "$DATA_PATH" ]; then
@@ -36,6 +49,7 @@ fi
 
 echo "=== TinyRecursiveModels Training ==="
 echo "Dataset: $DATA_PATH"
+echo "Architecture: $ARCH"
 echo "Additional args: $@"
 echo ""
 
@@ -49,13 +63,9 @@ export DISABLE_COMPILE="${DISABLE_COMPILE:-1}"
 # Default training parameters for smoke test (quick run)
 # Override by passing arguments like: epochs=1000 eval_interval=500
 python pretrain.py \
-    arch=trm \
+    arch="$ARCH" \
     "data_paths=[${DATA_PATH}]" \
     global_batch_size=32 \
     epochs=100 \
     eval_interval=50 \
-    arch.mlp_t=True \
-    arch.L_layers=2 \
-    arch.H_cycles=3 \
-    arch.L_cycles=6 \
     "$@"
