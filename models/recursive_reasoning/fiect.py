@@ -11,7 +11,7 @@ Combines the best innovations from existing models:
 7. Residual Gating - learned gating for stable iterative refinement
 """
 
-from typing import Tuple, Dict, Optional, List
+from typing import Tuple, Dict, Optional
 from dataclasses import dataclass
 import math
 import torch
@@ -20,7 +20,7 @@ from torch import nn
 from pydantic import BaseModel
 
 from models.common import trunc_normal_init_
-from models.layers import rms_norm, SwiGLU, RotaryEmbedding, CastedEmbedding, CastedLinear
+from models.layers import rms_norm, SwiGLU, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
 
 IGNORE_LABEL_ID = -100
@@ -220,13 +220,6 @@ class FIECTInner(nn.Module):
                 config.num_puzzle_identifiers, config.puzzle_emb_ndim,
                 batch_size=config.batch_size, init_std=0, cast_to=self.forward_dtype
             )
-
-        # Rotary embeddings
-        self.rotary_emb = RotaryEmbedding(
-            dim=config.hidden_size // config.num_heads,
-            max_position_embeddings=config.seq_len + config.puzzle_emb_len,
-            base=config.rope_theta
-        )
 
         # Processing blocks
         self.blocks = nn.ModuleList([
@@ -570,7 +563,8 @@ class FIECT(nn.Module):
         }
 
         # Run refinement iteration
-        iteration = steps[0].item() if steps.numel() > 0 else 0
+        # Note: Use mean step count as approximation (all active sequences should be at similar steps)
+        iteration = int(steps.float().mean().item()) if steps.numel() > 0 else 0
         (new_z, new_pred_embedding, new_confidence, new_memory, new_planner_state,
          logits, q_halt, q_continue) = self.inner(
             z, pred_embedding, confidence, memory, planner_state, current_data, iteration

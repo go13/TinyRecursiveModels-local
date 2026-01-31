@@ -94,12 +94,19 @@ class ACTLossHead(nn.Module):
         q_continue_loss = 0
         if "target_q_continue" in outputs:
             q_continue_loss = F.binary_cross_entropy_with_logits(outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum")
-
             metrics["q_continue_loss"] = q_continue_loss.detach()
+
+        # Value loss (for LBVS beam search)
+        value_loss = 0
+        if "value_loss" in outputs:
+            value_loss = outputs["value_loss"]
+            metrics["value_loss"] = value_loss.detach()
+
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
+        total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + value_loss
+        return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
 
 
 class MoRLossHead(nn.Module):
