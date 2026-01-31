@@ -20,6 +20,7 @@ class DataProcessConfig(BaseModel):
     output_dir: str = "data/sudoku-extreme-full"
 
     subsample_size: Optional[int] = None
+    test_subsample_size: Optional[int] = None  # Subsample size for test set (defaults to subsample_size if not set)
     min_difficulty: Optional[int] = None
     num_aug: int = 0
 
@@ -72,12 +73,21 @@ def convert_subset(set_name: str, config: DataProcessConfig):
                 inputs.append(np.frombuffer(q.replace('.', '0').encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
                 labels.append(np.frombuffer(a.encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
 
-    # If subsample_size is specified for the training set,
-    # randomly sample the desired number of examples.
+    # If subsample_size is specified, randomly sample the desired number of examples.
+    # For test set, use test_subsample_size if specified, otherwise fall back to subsample_size
+    target_subsample = None
     if set_name == "train" and config.subsample_size is not None:
+        target_subsample = config.subsample_size
+    elif set_name == "test":
+        if config.test_subsample_size is not None:
+            target_subsample = config.test_subsample_size
+        elif config.subsample_size is not None:
+            target_subsample = config.subsample_size  # Use same as train if not specified
+
+    if target_subsample is not None:
         total_samples = len(inputs)
-        if config.subsample_size < total_samples:
-            indices = np.random.choice(total_samples, size=config.subsample_size, replace=False)
+        if target_subsample < total_samples:
+            indices = np.random.choice(total_samples, size=target_subsample, replace=False)
             inputs = [inputs[i] for i in indices]
             labels = [labels[i] for i in indices]
 

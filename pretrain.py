@@ -11,6 +11,8 @@ import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader
 
+import time
+import numpy as np
 import tqdm
 import wandb
 import coolname
@@ -286,7 +288,7 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
 
     return evaluators
 
-def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
+def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int, step_start_time: float = None):
     train_state.step += 1
     if train_state.step > train_state.total_steps:  # At most train_total_steps
         return
@@ -334,12 +336,19 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         if rank == 0:
             metric_values = metric_values.cpu().numpy()
             reduced_metrics = {k: metric_values[i] for i, k in enumerate(metric_keys)}
-            
+
             # Postprocess
             count = max(reduced_metrics["count"], 1)  # Avoid NaNs
             reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
 
             reduced_metrics["train/lr"] = lr_this_step
+
+            # Add timing info if available
+            if step_start_time is not None:
+                step_time = time.time() - step_start_time
+                reduced_metrics["train/step_time"] = step_time
+                reduced_metrics["train/samples_per_sec"] = global_batch_size / step_time
+
             return reduced_metrics
 
 def evaluate(
@@ -370,12 +379,32 @@ def evaluate(
 
         carry = None
         processed_batches = 0
-        
-        for set_name, batch, global_batch_size in eval_loader:
+        total_samples = 0
+        total_inference_steps = 0
+        eval_start_time = time.time()
+
+        # Estimate total batches for evaluation (based on total examples in test set)
+        # Each set has total_examples, and we process global_batch_size at a time
+        estimated_total_batches = 0
+        for set_name in eval_metadata.sets:
+            # Rough estimate: total_puzzles * mean_examples_per_puzzle / batch_size
+            set_examples = eval_metadata.total_puzzles * eval_metadata.mean_puzzle_examples
+            estimated_total_batches += int(np.ceil(set_examples / config.global_batch_size))
+
+        # Create progress bar for evaluation
+        eval_pbar = None
+        if rank == 0:
+            eval_pbar = tqdm.tqdm(eval_loader, desc="Evaluating", unit="batch",
+                                   total=estimated_total_batches, leave=False)
+            eval_iterator = eval_pbar
+        else:
+            eval_iterator = eval_loader
+
+        for set_name, batch, global_batch_size in eval_iterator:
             processed_batches += 1
-            if rank == 0:
-                print(f"Processing batch {processed_batches}: {set_name}")
-            
+            batch_size = batch["inputs"].shape[0]
+            total_samples += batch_size
+
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
@@ -392,8 +421,18 @@ def evaluate(
                 if all_finish:
                     break
 
-            if rank == 0:
-                print(f"  Completed inference in {inference_steps} steps")
+            total_inference_steps += inference_steps
+
+            # Update progress bar
+            if eval_pbar is not None:
+                elapsed = time.time() - eval_start_time
+                samples_per_sec = total_samples / elapsed if elapsed > 0 else 0
+                avg_steps = total_inference_steps / processed_batches
+                eval_pbar.set_postfix({
+                    "samp/s": f"{samples_per_sec:.1f}",
+                    "avg_steps": f"{avg_steps:.1f}",
+                    "set": set_name
+                })
 
             for collection in (batch, preds):
                 for k, v in collection.items():
@@ -420,6 +459,13 @@ def evaluate(
             metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
 
             del metrics
+
+        # Close progress bar and print summary
+        if eval_pbar is not None:
+            eval_pbar.close()
+            eval_elapsed = time.time() - eval_start_time
+            print(f"Evaluation complete: {total_samples} samples in {eval_elapsed:.1f}s "
+                  f"({total_samples/eval_elapsed:.1f} samp/s, avg {total_inference_steps/processed_batches:.1f} inference steps)")
 
         # concatenate save preds
         save_preds = {k: torch.cat(v, dim=0) for k, v in save_preds.items()}
@@ -453,6 +499,21 @@ def evaluate(
                 for set_name, m in reduced_metrics.items():
                     count = m.pop("count")
                     reduced_metrics[set_name] = {k: v / count for k, v in m.items()}
+
+                # Print evaluation summary
+                print("\n" + "="*60)
+                print("EVALUATION RESULTS")
+                print("="*60)
+                for set_name, m in reduced_metrics.items():
+                    print(f"\n[{set_name}]")
+                    for metric_name, value in sorted(m.items()):
+                        if "accuracy" in metric_name.lower():
+                            print(f"  {metric_name}: {value:.2%}")
+                        elif "loss" in metric_name.lower():
+                            print(f"  {metric_name}: {value:.4f}")
+                        else:
+                            print(f"  {metric_name}: {value:.4f}")
+                print("="*60 + "\n")
 
         # Run evaluators
         if rank == 0:
@@ -586,7 +647,9 @@ def launch(hydra_config: DictConfig):
     progress_bar = None
     ema_helper = None
     if RANK == 0:
-        progress_bar = tqdm.tqdm(total=train_state.total_steps)
+        progress_bar = tqdm.tqdm(total=train_state.total_steps, desc="Training",
+                                  unit="step", dynamic_ncols=True,
+                                  bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}')
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
@@ -596,26 +659,52 @@ def launch(hydra_config: DictConfig):
         ema_helper.register(train_state.model)
 
     # Training Loop
+    batches_per_epoch = int(train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
     for _iter_id in range(total_iters):
-        print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
+        current_epoch = _iter_id * train_epochs_per_iter
+        if RANK == 0:
+            gpu_mem = torch.cuda.memory_allocated() / 1024**3
+            gpu_mem_max = torch.cuda.max_memory_allocated() / 1024**3
+            print(f"\n{'='*60}")
+            print(f"Epoch {current_epoch}/{config.epochs} (iter {_iter_id+1}/{total_iters})")
+            print(f"Step {train_state.step}/{train_state.total_steps} | ~{batches_per_epoch} batches/epoch")
+            print(f"GPU Memory: {gpu_mem:.1f}GB / {gpu_mem_max:.1f}GB peak")
+            print(f"{'='*60}")
 
         ############ Train Iter
         if RANK == 0:
-            print("TRAIN")
+            print("\n[TRAINING]")
         train_state.model.train()
         for set_name, batch, global_batch_size in train_loader:
-            metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+            step_start_time = time.time()
+            metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, step_start_time=step_start_time)
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+
+                # Update progress bar with useful metrics
+                postfix = {}
+                if "train/loss" in metrics:
+                    postfix["loss"] = f"{metrics['train/loss']:.4f}"
+                if "train/accuracy" in metrics:
+                    postfix["acc"] = f"{metrics['train/accuracy']:.2%}"
+                if "train/exact_accuracy" in metrics:
+                    postfix["exact"] = f"{metrics['train/exact_accuracy']:.2%}"
+                if "train/lr" in metrics:
+                    postfix["lr"] = f"{metrics['train/lr']:.2e}"
+                if "train/samples_per_sec" in metrics:
+                    postfix["samp/s"] = f"{metrics['train/samples_per_sec']:.1f}"
+                if postfix:
+                    progress_bar.set_postfix(postfix)
+
             if config.ema:
                 ema_helper.update(train_state.model)
 
         if _iter_id >= config.min_eval_interval:
             ############ Evaluation
             if RANK == 0:
-                print("EVALUATE")
+                print("\n[EVALUATION]")
             if config.ema:
                 print("SWITCH TO EMA")
                 train_state_eval = copy.deepcopy(train_state)
@@ -636,10 +725,10 @@ def launch(hydra_config: DictConfig):
                 wandb.log(metrics, step=train_state.step)
                 
             ############ Checkpointing
-            if RANK == 0:
-                print("SAVE CHECKPOINT")
             if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
                 save_train_state(config, train_state_eval)
+                if config.checkpoint_path:
+                    print(f"Checkpoint saved: {config.checkpoint_path}/step_{train_state.step}")
 
             if config.ema:
                 del train_state_eval
