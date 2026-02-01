@@ -13,7 +13,7 @@ max_iterations: 6
 halt_exploration_prob: 0.1
 
 # Architecture - tiny
-num_layers: 1
+num_layers: 2
 hidden_size: 128
 num_heads: 4
 expansion: 4

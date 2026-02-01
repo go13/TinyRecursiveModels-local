@@ -60,12 +60,13 @@ run_model() {
   printf "%s|%s|%s|%s|%s|%s\n" "$arch" "$acc" "$exact" "$lm" "$qhalt" "$steps" >> "$RESULTS_FILE"
 }
 
-#run_model "1/5" "trm_tiny"
-#run_model "2/5" "iect_tiny"
-#run_model "3/5" "iect_tiny_v2"
+run_model "1/6" "trm_tiny"
+run_model "2/6" "iect_tiny"
+run_model "3/6" "iect_tiny_v2"
 # run_model "X/X" "trm_mor_small"  # Disabled due to gradient issue
-#run_model "4/5" "fiect_tiny"
-run_model "5/5" "lbvs_tiny"
+run_model "4/6" "fiect_tiny"
+run_model "5/6" "lbvs_tiny"
+run_model "6/6" "lbvs_tiny_film"
 
 # Pretty table
 printf "\n%-12s | %-12s | %-14s | %-10s | %-16s | %-8s\n" "model" "accuracy" "exact_accuracy" "lm_loss" "q_halt_accuracy" "steps"

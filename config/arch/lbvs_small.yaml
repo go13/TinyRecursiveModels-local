@@ -1,0 +1,25 @@
+name: recursive_reasoning.lbvs@LBVS
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+# Beam search config
+num_candidates: 4  # K: candidates to generate
+num_beams: 2  # B: beams to keep
+branch_strategy: learned_perturbation
+
+# Iteration config
+max_iterations: 8
+halt_exploration_prob: 0.1
+
+# Architecture - small
+num_layers: 3
+hidden_size: 256
+num_heads: 4
+expansion: 4
+
+# Embeddings
+puzzle_emb_ndim: ${.hidden_size}
+puzzle_emb_len: 8
+
+forward_dtype: bfloat16

@@ -3,18 +3,16 @@ LBVS - Latent Beam Value Search
 
 A beam search model that operates in latent space:
 1. Generate K candidate latent states via learned branch projections
-2. Score candidates by LM loss (training) or value head (inference)
+2. Score candidates by blended q-head/value-head (q shared for halting)
 3. Keep top-B beams based on scores
 4. Decode best beam at the end
 
 Key design:
 - Branches from ALL beams for diversity
-- Training: scores = LM loss on labels (ground truth supervision)
-- Inference: scores = value head (learned to predict LM quality)
-- Value head trained as auxiliary task to predict candidate ranking
+- Q-head used for halting; beam selection blends q and value
 """
 
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional
 from dataclasses import dataclass
 from enum import Enum
 import math
@@ -24,7 +22,7 @@ from torch import nn
 from pydantic import BaseModel
 
 from models.common import trunc_normal_init_
-from models.layers import rms_norm, SwiGLU, CastedEmbedding, CastedLinear
+from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
 
 IGNORE_LABEL_ID = -100
@@ -34,6 +32,7 @@ class BranchStrategy(str, Enum):
     """Strategies for generating beam candidates."""
     LEARNED_PERTURBATION = "learned_perturbation"  # K learned delta projections
     STOCHASTIC = "stochastic"  # Add learned noise, sample K times
+    FILM = "film"  # Per-branch scale/shift modulation
     # Future: ATTENTION_MODES, MIXTURE_OF_EXPERTS, etc.
 
 
@@ -72,6 +71,7 @@ class LBVSConfig(BaseModel):
 
     # Value loss weight
     value_loss_weight: float = 0.1
+    q_value_blend_alpha: float = 0.5
 
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
@@ -80,17 +80,19 @@ class LBVSConfig(BaseModel):
 
 
 class LBVSBlock(nn.Module):
-    """Simple transformer block for processing latent states."""
+    """Attention-based transformer block for processing latent states."""
 
     def __init__(self, config: LBVSConfig):
         super().__init__()
         self.config = config
         self.norm_eps = config.rms_norm_eps
 
-        # Temporal MLP
-        self.mlp_t = SwiGLU(
-            hidden_size=config.seq_len + config.puzzle_emb_len,
-            expansion=config.expansion,
+        self.self_attn = Attention(
+            hidden_size=config.hidden_size,
+            head_dim=config.hidden_size // config.num_heads,
+            num_heads=config.num_heads,
+            num_key_value_heads=config.num_heads,
+            causal=False,
         )
 
         # Channel MLP
@@ -99,14 +101,14 @@ class LBVSBlock(nn.Module):
             expansion=config.expansion,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, cos_sin, hidden_states: torch.Tensor, attn_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         # hidden_states: [B*num_beams, L, D] or [B, L, D]
 
-        # Temporal mixing
-        h = hidden_states.transpose(1, 2)
-        h = self.mlp_t(h)
-        h = h.transpose(1, 2)
-        hidden_states = rms_norm(hidden_states + h, variance_epsilon=self.norm_eps)
+        # Self Attention
+        hidden_states = rms_norm(
+            hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states, attn_bias=attn_bias),
+            variance_epsilon=self.norm_eps,
+        )
 
         # Channel mixing
         h = self.mlp(hidden_states)
@@ -139,6 +141,10 @@ class BranchGenerator(nn.Module):
             # Learned noise scale per position
             self.noise_scale = nn.Parameter(torch.ones(config.hidden_size) * 0.1)
             self.noise_proj = CastedLinear(config.hidden_size, config.hidden_size, bias=True)
+        elif self.strategy == BranchStrategy.FILM:
+            # Per-branch scale/shift modulation
+            self.film_scale = nn.Parameter(torch.zeros(config.num_candidates, config.hidden_size))
+            self.film_shift = nn.Parameter(torch.zeros(config.num_candidates, config.hidden_size))
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
@@ -175,6 +181,12 @@ class BranchGenerator(nn.Module):
             projected_noise = self.noise_proj(noise)
             candidates = z_flat.unsqueeze(1) + projected_noise  # [B * num_beams, K, L, D]
             candidates = candidates.view(B, num_beams * K, L, D)
+        elif self.strategy == BranchStrategy.FILM:
+            scales = 1.0 + self.film_scale.view(1, K, 1, 1, D)
+            shifts = self.film_shift.view(1, K, 1, 1, D)
+            z_expanded = z_flat.unsqueeze(1).unsqueeze(2)  # [B*num_beams, 1, 1, L, D]
+            modulated = z_expanded * scales + shifts  # [B*num_beams, K, 1, L, D]
+            candidates = modulated.squeeze(2).view(B, num_beams * K, L, D)
 
         return candidates
 
@@ -243,10 +255,25 @@ class LBVSInner(nn.Module):
                 batch_size=config.batch_size, init_std=0, cast_to=self.forward_dtype
             )
 
-        # Processing blocks
-        self.blocks = nn.ModuleList([
-            LBVSBlock(config) for _ in range(config.num_layers)
+        # Processing blocks (pre/post around branching)
+        pre_layers = max(1, config.num_layers // 2)
+        post_layers = max(1, config.num_layers - pre_layers)
+        self.pre_blocks = nn.ModuleList([
+            LBVSBlock(config) for _ in range(pre_layers)
         ])
+        self.post_blocks = nn.ModuleList([
+            LBVSBlock(config) for _ in range(post_layers)
+        ])
+
+        # RoPE
+        self.rotary_emb = RotaryEmbedding(
+            dim=config.hidden_size // config.num_heads,
+            max_position_embeddings=config.seq_len + self.puzzle_emb_len,
+            base=config.rope_theta,
+        )
+        self.rel_pos_bias = nn.Parameter(
+            torch.zeros(config.num_heads, config.seq_len + self.puzzle_emb_len, config.seq_len + self.puzzle_emb_len)
+        )
 
         # Beam search components
         self.branch_generator = BranchGenerator(config)
@@ -294,12 +321,12 @@ class LBVSInner(nn.Module):
         beam_values: torch.Tensor,  # [B, num_beams]
         batch: Dict[str, torch.Tensor],
         training: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Single iteration with beam search.
 
-        Key insight: During training, score candidates by actual LM loss (we have labels).
-        Value head is trained as auxiliary task to predict this ranking for inference.
+        Key insight: Use a blend of q-head and value-head for beam selection,
+        while q-head still drives halting.
 
         Returns:
             new_z: [B, num_beams, L, D] updated latent states (detached for carry)
@@ -309,14 +336,13 @@ class LBVSInner(nn.Module):
             q_halt_logits: [B] halt logits
             q_continue_logits: [B] continue logits
             value_loss: scalar, loss for training value head
+            q_value_loss: scalar, loss for training q head on beam quality
         """
         B = z.shape[0]
         num_beams = z.shape[1]
         L = z.shape[2]
         D = z.shape[3]
         K = self.config.num_candidates
-        vocab_size = self.config.vocab_size
-        seq_len = self.config.seq_len  # actual sequence length without puzzle prefix
 
         # Get input embeddings
         input_emb = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
@@ -335,10 +361,12 @@ class LBVSInner(nn.Module):
         gate = torch.sigmoid(self.fusion_gate(fusion_input))
         z_fused = gate * (input_flat + pred_flat) + (1 - gate) * z_flat
 
-        # Process through blocks
+        # Process through pre-branch blocks
         h = z_fused
-        for block in self.blocks:
-            h = block(h)
+        cos_sin = self.rotary_emb()
+        attn_bias = self.rel_pos_bias[:, :L, :L].unsqueeze(0).to(h.dtype)
+        for block in self.pre_blocks:
+            h = block(cos_sin, h, attn_bias=attn_bias)
 
         # Reshape back: [B, num_beams, L, D]
         z_processed = h.view(B, num_beams, L, D)
@@ -347,29 +375,47 @@ class LBVSInner(nn.Module):
         candidates = self.branch_generator(z_processed)  # [B, num_beams * K, L, D]
         total_candidates = num_beams * K
 
+        # Process candidates through post-branch blocks
+        candidates_flat = candidates.view(B * total_candidates, L, D)
+        for block in self.post_blocks:
+            candidates_flat = block(cos_sin, candidates_flat, attn_bias=attn_bias)
+        candidates = candidates_flat.view(B, total_candidates, L, D)
+
         # === SCORE CANDIDATES ===
-        # During training: use LM loss (ground truth) for selection
-        # During inference: use value head
+        # Blend q-head and value-head for beam selection; q-head still drives halting.
 
-        # Always compute value head predictions (for auxiliary training)
-        candidate_values = self.value_head(candidates)  # [B, num_beams * K]
+        # Parent beam score accumulation
+        parent_scores = (
+            beam_values.unsqueeze(-1)
+            .expand(-1, num_beams, K)
+            .reshape(B, total_candidates)
+        )
 
-        if training:
-            # Decode ALL candidates and score by LM loss
-            # This is more expensive but gives proper learning signal
-            candidates_flat = candidates.view(B * total_candidates, L, D)
+        # Use q-halt logits from candidate first token as beam quality
+        candidates_flat = candidates.view(B * total_candidates, L, D)
+        candidate_q_logits = self.q_head(candidates_flat[:, 0]).to(torch.float32)
+        candidate_q_scores = candidate_q_logits[:, 0].view(B, total_candidates)
+
+        # Value head provides an auxiliary beam signal
+        candidate_values = self.value_head(candidates).to(torch.float32)  # [B, num_beams * K]
+
+        alpha = self.config.q_value_blend_alpha
+        candidate_scores = alpha * candidate_q_scores + (1.0 - alpha) * candidate_values + parent_scores
+        top_scores, top_indices = candidate_scores.topk(num_beams, dim=1)
+
+        # Optional value/q supervision from LM loss (if labels available)
+        labels = batch.get("labels", None)
+        if labels is not None:
+            vocab_size = self.config.vocab_size
+            seq_len = self.config.seq_len  # actual sequence length without puzzle prefix
+
             all_logits = self.lm_head(candidates_flat)[:, self.puzzle_emb_len:]  # [B*cand, seq_len, vocab]
             all_logits = all_logits.view(B, total_candidates, seq_len, vocab_size)
 
-            # Get labels and compute per-candidate loss
-            labels = batch["labels"]  # [B, seq_len]
             mask = (labels != IGNORE_LABEL_ID)  # [B, seq_len]
-
-            # Expand labels for all candidates
             labels_expanded = labels.unsqueeze(1).expand(-1, total_candidates, -1)  # [B, cand, seq_len]
             mask_expanded = mask.unsqueeze(1).expand(-1, total_candidates, -1)  # [B, cand, seq_len]
 
-            # Compute cross entropy per candidate
             all_logits_flat = all_logits.reshape(B * total_candidates * seq_len, vocab_size)
             labels_flat = labels_expanded.reshape(B * total_candidates * seq_len)
 
@@ -380,36 +426,27 @@ class LBVSInner(nn.Module):
                 reduction='none'
             ).view(B, total_candidates, seq_len)
 
-            # Average loss per candidate (lower is better)
-            denom = mask_expanded.sum(-1).clamp(min=1).to(per_token_loss.dtype)  # [B, cand]
+            denom = mask_expanded.sum(-1).clamp(min=1).to(per_token_loss.dtype)
             candidate_losses = (per_token_loss * mask_expanded).sum(-1) / denom  # [B, cand]
+            candidate_step_scores = -candidate_losses
 
-            # Score = negative loss (higher score = better candidate)
-            candidate_scores = -candidate_losses  # [B, cand]
-
-            # Select top-B by LM score
-            top_scores, top_indices = candidate_scores.topk(num_beams, dim=1)  # [B, num_beams]
-
-            # Train value head to predict this ranking (auxiliary task)
-            # Target: value should match normalized LM scores
             with torch.no_grad():
-                # Normalize scores to [0, 1] range for BCE-style loss
-                score_min = candidate_scores.min(dim=1, keepdim=True).values
-                score_max = candidate_scores.max(dim=1, keepdim=True).values
+                score_min = candidate_step_scores.min(dim=1, keepdim=True).values
+                score_max = candidate_step_scores.max(dim=1, keepdim=True).values
                 score_range = (score_max - score_min).clamp(min=1e-6)
-                normalized_targets = (candidate_scores - score_min) / score_range
+                normalized_targets = (candidate_step_scores - score_min) / score_range
 
-            # Cast to float32 for stable loss computation
             value_loss = F.mse_loss(
-                torch.sigmoid(candidate_values.to(torch.float32)),
+                torch.sigmoid(candidate_values),
                 normalized_targets.to(torch.float32)
             )
-
+            q_value_loss = F.mse_loss(
+                torch.sigmoid(candidate_q_scores),
+                normalized_targets.to(torch.float32)
+            )
         else:
-            # Inference: use value head for selection (no labels available)
-            candidate_scores = candidate_values.to(torch.float32)
-            top_scores, top_indices = candidate_scores.topk(num_beams, dim=1)
             value_loss = torch.tensor(0.0, device=z.device, dtype=torch.float32)
+            q_value_loss = torch.tensor(0.0, device=z.device, dtype=torch.float32)
 
         # Gather selected beams
         top_indices_expanded = top_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, L, D)
@@ -446,6 +483,7 @@ class LBVSInner(nn.Module):
             q_halt_logits,
             q_continue_logits,
             value_loss,
+            q_value_loss,
         )
 
 
@@ -453,10 +491,9 @@ class LBVS(nn.Module):
     """
     Latent Beam Value Search model.
 
-    Beam search in latent space with proper learning signal:
-    - Training: candidates scored by actual LM loss (ground truth)
-    - Inference: candidates scored by value head (learned predictor)
-    - Value head trained as auxiliary task to predict LM quality
+    Beam search in latent space:
+    - Beam selection blends q-head and value head
+    - Q-head used for halting
     - Branches from ALL beams for diversity
     - Prediction feedback for iterative refinement
     """
@@ -538,7 +575,7 @@ class LBVS(nn.Module):
         }
 
         # Run beam search iteration
-        new_z, new_pred_embedding, new_beam_values, logits, q_halt, q_continue, value_loss = self.inner(
+        new_z, new_pred_embedding, new_beam_values, logits, q_halt, q_continue, value_loss, q_value_loss = self.inner(
             z, pred_embedding, beam_values, current_data, training=self.training
         )
 
@@ -551,6 +588,7 @@ class LBVS(nn.Module):
             "q_continue_logits": q_continue,
             "beam_values": new_beam_values,
             "value_loss": value_loss,
+            "q_value_loss": q_value_loss,
         }
 
         with torch.no_grad():

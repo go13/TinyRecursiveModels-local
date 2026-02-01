@@ -101,11 +101,16 @@ class ACTLossHead(nn.Module):
         if "value_loss" in outputs:
             value_loss = outputs["value_loss"]
             metrics["value_loss"] = value_loss.detach()
+        # Q-value loss (for LBVS beam search)
+        q_value_loss = 0
+        if "q_value_loss" in outputs:
+            q_value_loss = outputs["q_value_loss"]
+            metrics["q_value_loss"] = q_value_loss.detach()
 
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + value_loss
+        total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + value_loss + q_value_loss
         return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
 
 

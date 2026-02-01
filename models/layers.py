@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, Optional
 import einops
 import torch
 from torch import nn
@@ -110,7 +110,7 @@ class Attention(nn.Module):
         self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
         self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, attn_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
         # hidden_states: [bs, seq_len, num_heads, head_dim]
@@ -129,7 +129,15 @@ class Attention(nn.Module):
 
         # flash attn
         query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value)) # needed for scaled_dot_product_attention but not flash_attn_func
-        attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=self.causal)
+        if attn_bias is not None and attn_bias.dtype is not torch.bool and attn_bias.dtype != query.dtype:
+            attn_bias = attn_bias.to(query.dtype)
+        attn_output = scaled_dot_product_attention(
+            query=query,
+            key=key,
+            value=value,
+            attn_mask=attn_bias,
+            is_causal=self.causal,
+        )
         attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
         attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)  # type: ignore
         return self.o_proj(attn_output)
