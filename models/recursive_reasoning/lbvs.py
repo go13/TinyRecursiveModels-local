@@ -33,6 +33,7 @@ class BranchStrategy(str, Enum):
     LEARNED_PERTURBATION = "learned_perturbation"  # K learned delta projections
     STOCHASTIC = "stochastic"  # Add learned noise, sample K times
     FILM = "film"  # Per-branch scale/shift modulation
+    BRANCH_TOKENS = "branch_tokens"  # Per-branch token injection
     # Future: ATTENTION_MODES, MIXTURE_OF_EXPERTS, etc.
 
 
@@ -72,6 +73,10 @@ class LBVSConfig(BaseModel):
     # Value loss weight
     value_loss_weight: float = 0.1
     q_value_blend_alpha: float = 0.5
+    beam_rank_loss_weight: float = 0.1
+    ga_num_candidates: int = 0  # Extra crossover candidates per batch item
+    ga_mix_alpha: float = 0.5  # Fixed mix ratio for crossover
+    use_ind_token: bool = True
 
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
@@ -145,6 +150,10 @@ class BranchGenerator(nn.Module):
             # Per-branch scale/shift modulation
             self.film_scale = nn.Parameter(torch.zeros(config.num_candidates, config.hidden_size))
             self.film_shift = nn.Parameter(torch.zeros(config.num_candidates, config.hidden_size))
+        elif self.strategy == BranchStrategy.BRANCH_TOKENS:
+            # Learned tokens that represent distinct hypotheses
+            self.branch_tokens = nn.Parameter(torch.zeros(config.num_candidates, config.hidden_size))
+            nn.init.normal_(self.branch_tokens, std=0.02)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
@@ -187,6 +196,12 @@ class BranchGenerator(nn.Module):
             z_expanded = z_flat.unsqueeze(1).unsqueeze(2)  # [B*num_beams, 1, 1, L, D]
             modulated = z_expanded * scales + shifts  # [B*num_beams, K, 1, L, D]
             candidates = modulated.squeeze(2).view(B, num_beams * K, L, D)
+        elif self.strategy == BranchStrategy.BRANCH_TOKENS:
+            tokens = self.branch_tokens.view(1, K, 1, D)
+            z_expanded = z_flat.unsqueeze(1)  # [B*num_beams, K, L, D] after broadcast
+            candidates = z_expanded.clone()
+            candidates[:, :, 0, :] = candidates[:, :, 0, :] + tokens  # inject into first position
+            candidates = candidates.view(B, num_beams * K, L, D)
 
         return candidates
 
@@ -215,11 +230,17 @@ class ValueHead(nn.Module):
         Returns:
             values: [B, K] or [B] value scores
         """
-        # Global average pooling over sequence
+        # Use induction token if enabled, otherwise global average pooling
         if z.dim() == 4:
-            pooled = z.mean(dim=2)  # [B, K, D]
+            if self.config.use_ind_token:
+                pooled = z[:, :, 0, :]  # [B, K, D]
+            else:
+                pooled = z.mean(dim=2)  # [B, K, D]
         else:
-            pooled = z.mean(dim=1)  # [B, D]
+            if self.config.use_ind_token:
+                pooled = z[:, 0, :]  # [B, D]
+            else:
+                pooled = z.mean(dim=1)  # [B, D]
 
         values = self.value_net(pooled).squeeze(-1)  # [B, K] or [B]
         return values
@@ -293,6 +314,8 @@ class LBVSInner(nn.Module):
             trunc_normal_init_(torch.empty(config.hidden_size, dtype=self.forward_dtype), std=1),
             persistent=True
         )
+        self.ind_token = nn.Parameter(torch.zeros(config.hidden_size))
+        nn.init.normal_(self.ind_token, std=0.02)
 
         # Initialize Q head conservatively
         with torch.no_grad():
@@ -321,7 +344,7 @@ class LBVSInner(nn.Module):
         beam_values: torch.Tensor,  # [B, num_beams]
         batch: Dict[str, torch.Tensor],
         training: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Single iteration with beam search.
 
@@ -337,9 +360,15 @@ class LBVSInner(nn.Module):
             q_continue_logits: [B] continue logits
             value_loss: scalar, loss for training value head
             q_value_loss: scalar, loss for training q head on beam quality
+            rank_loss: scalar, pairwise ranking loss for beam scores
         """
         B = z.shape[0]
         num_beams = z.shape[1]
+        if beam_values.shape[1] != num_beams:
+            num_beams = min(num_beams, beam_values.shape[1])
+            z = z[:, :num_beams]
+            pred_embedding = pred_embedding[:, :num_beams]
+            beam_values = beam_values[:, :num_beams]
         L = z.shape[2]
         D = z.shape[3]
         K = self.config.num_candidates
@@ -360,6 +389,8 @@ class LBVSInner(nn.Module):
         fusion_input = torch.cat([input_flat + pred_flat, z_flat], dim=-1)
         gate = torch.sigmoid(self.fusion_gate(fusion_input))
         z_fused = gate * (input_flat + pred_flat) + (1 - gate) * z_flat
+        if self.config.use_ind_token:
+            z_fused[:, 0, :] = z_fused[:, 0, :] + self.ind_token.to(z_fused.dtype)
 
         # Process through pre-branch blocks
         h = z_fused
@@ -375,6 +406,36 @@ class LBVSInner(nn.Module):
         candidates = self.branch_generator(z_processed)  # [B, num_beams * K, L, D]
         total_candidates = num_beams * K
 
+        # Optional GA-style crossover candidates
+        parent_scores = (
+            beam_values.unsqueeze(-1)
+            .expand(-1, num_beams, K)
+            .reshape(B, total_candidates)
+        )
+        if self.config.ga_num_candidates > 0:
+            ga_k = self.config.ga_num_candidates
+            idx_a = torch.randint(0, num_beams, (B, ga_k), device=z.device, dtype=torch.long)
+            idx_b = torch.randint(0, num_beams, (B, ga_k), device=z.device, dtype=torch.long)
+            if num_beams > 0:
+                idx_a = idx_a.clamp_max(num_beams - 1)
+                idx_b = idx_b.clamp_max(num_beams - 1)
+
+            gather_a = idx_a.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, L, D)
+            gather_b = idx_b.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, L, D)
+            z_a = torch.gather(z_processed, 1, gather_a)
+            z_b = torch.gather(z_processed, 1, gather_b)
+
+            alpha = self.config.ga_mix_alpha
+            ga_candidates = alpha * z_a + (1.0 - alpha) * z_b  # [B, ga_k, L, D]
+
+            score_a = torch.gather(beam_values, 1, idx_a)
+            score_b = torch.gather(beam_values, 1, idx_b)
+            ga_parent_scores = alpha * score_a + (1.0 - alpha) * score_b  # [B, ga_k]
+
+            candidates = torch.cat([candidates, ga_candidates], dim=1)
+            parent_scores = torch.cat([parent_scores, ga_parent_scores], dim=1)
+            total_candidates = candidates.shape[1]
+
         # Process candidates through post-branch blocks
         candidates_flat = candidates.view(B * total_candidates, L, D)
         for block in self.post_blocks:
@@ -383,13 +444,6 @@ class LBVSInner(nn.Module):
 
         # === SCORE CANDIDATES ===
         # Blend q-head and value-head for beam selection; q-head still drives halting.
-
-        # Parent beam score accumulation
-        parent_scores = (
-            beam_values.unsqueeze(-1)
-            .expand(-1, num_beams, K)
-            .reshape(B, total_candidates)
-        )
 
         # Use q-halt logits from candidate first token as beam quality
         candidates_flat = candidates.view(B * total_candidates, L, D)
@@ -444,9 +498,18 @@ class LBVSInner(nn.Module):
                 torch.sigmoid(candidate_q_scores),
                 normalized_targets.to(torch.float32)
             )
+
+            # Pairwise ranking loss: encourage blended scores to rank LM-top above LM-bottom
+            top_idx = torch.argmax(candidate_step_scores, dim=1)
+            bottom_idx = torch.argmin(candidate_step_scores, dim=1)
+            top_scores = candidate_scores.gather(1, top_idx.unsqueeze(1))
+            bottom_scores = candidate_scores.gather(1, bottom_idx.unsqueeze(1))
+            rank_loss = F.softplus(-(top_scores - bottom_scores)).mean()
+            rank_loss = rank_loss * self.config.beam_rank_loss_weight
         else:
             value_loss = torch.tensor(0.0, device=z.device, dtype=torch.float32)
             q_value_loss = torch.tensor(0.0, device=z.device, dtype=torch.float32)
+            rank_loss = torch.tensor(0.0, device=z.device, dtype=torch.float32)
 
         # Gather selected beams
         top_indices_expanded = top_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, L, D)
@@ -484,6 +547,7 @@ class LBVSInner(nn.Module):
             q_continue_logits,
             value_loss,
             q_value_loss,
+            rank_loss,
         )
 
 
@@ -575,7 +639,7 @@ class LBVS(nn.Module):
         }
 
         # Run beam search iteration
-        new_z, new_pred_embedding, new_beam_values, logits, q_halt, q_continue, value_loss, q_value_loss = self.inner(
+        new_z, new_pred_embedding, new_beam_values, logits, q_halt, q_continue, value_loss, q_value_loss, rank_loss = self.inner(
             z, pred_embedding, beam_values, current_data, training=self.training
         )
 
@@ -589,6 +653,7 @@ class LBVS(nn.Module):
             "beam_values": new_beam_values,
             "value_loss": value_loss,
             "q_value_loss": q_value_loss,
+            "rank_loss": rank_loss,
         }
 
         with torch.no_grad():

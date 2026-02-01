@@ -2,8 +2,8 @@
 set -euo pipefail
 
 DATA_PATH=${1:-data/sudoku-test-50-aug-5}
-EPOCHS=${2:-20}
-EVAL_INTERVAL=${3:-20}
+EPOCHS=${2:-200}
+EVAL_INTERVAL=${3:-50}
 shift $(( $# > 3 ? 3 : $# )) || true
 EXTRA_ARGS=("$@")
 
@@ -16,9 +16,7 @@ get_metric() {
   local log_file="$1"
   local key="$2"
   awk -F': ' -v key="$key" '
-    {
-      gsub(/\r/, "", $0)
-    }
+    { gsub(/\r/, "", $0) }
     /^[[:space:]]*([A-Za-z_]+)[[:space:]]*:/ {
       k=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
       if (k==key) {val=$2}
@@ -46,7 +44,6 @@ run_model() {
     echo "Training + evaluation in progress..."
   } >&2
 
-  # Keep tqdm progress bars; tee to log for parsing but send live output to stderr
   bash run_train.sh "$DATA_PATH" "$arch" epochs="$EPOCHS" eval_interval="$EVAL_INTERVAL" "${EXTRA_ARGS[@]}" \
     2>&1 | tee "$log_file" >&2
 
@@ -60,18 +57,12 @@ run_model() {
   printf "%s|%s|%s|%s|%s|%s\n" "$arch" "$acc" "$exact" "$lm" "$qhalt" "$steps" >> "$RESULTS_FILE"
 }
 
-run_model "1/7" "trm_tiny"
-run_model "2/7" "iect_tiny"
-run_model "3/7" "iect_tiny_v2"
-# run_model "X/X" "trm_mor_small"  # Disabled due to gradient issue
-run_model "4/7" "fiect_tiny"
-run_model "5/7" "lbvs_tiny"
-run_model "6/7" "lbvs_tiny_film"
-run_model "7/7" "lbvs_tiny_ga"
+run_model "1/3" "trm_overnight"
+run_model "2/3" "iect_overnight"
+run_model "3/3" "lbvs_overnight"
 
-# Pretty table
-printf "\n%-12s | %-12s | %-14s | %-10s | %-16s | %-8s\n" "model" "accuracy" "exact_accuracy" "lm_loss" "q_halt_accuracy" "steps"
-printf "%s\n" "-----------------------------------------------------------------------------------------------"
+printf "\n%-16s | %-12s | %-14s | %-10s | %-16s | %-8s\n" "model" "accuracy" "exact_accuracy" "lm_loss" "q_halt_accuracy" "steps"
+printf "%s\n" "------------------------------------------------------------------------------------------------"
 while IFS='|' read -r model acc exact lm qhalt steps; do
-  printf "%-12s | %-12s | %-14s | %-10s | %-16s | %-8s\n" "$model" "${acc:-NA}" "${exact:-NA}" "${lm:-NA}" "${qhalt:-NA}" "${steps:-NA}"
+  printf "%-16s | %-12s | %-14s | %-10s | %-16s | %-8s\n" "$model" "${acc:-NA}" "${exact:-NA}" "${lm:-NA}" "${qhalt:-NA}" "${steps:-NA}"
 done < "$RESULTS_FILE"

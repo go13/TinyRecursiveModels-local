@@ -57,9 +57,10 @@ run_model() {
   printf "%s|%s|%s|%s|%s|%s\n" "$arch" "$acc" "$exact" "$lm" "$qhalt" "$steps" >> "$RESULTS_FILE"
 }
 
-run_model "1/3" "trm_small"
-run_model "2/3" "iect_small"
-run_model "3/3" "lbvs_small"
+run_model "1/4" "trm_small"
+run_model "2/4" "iect_small"
+run_model "3/4" "lbvs_small"
+run_model "4/4" "lbvs_small_ga"
 #run_model "X/X" "trm_mor_small"
 #run_model "X/X" "trm_mor_small_no_film"
 #run_model "X/X" "trm_mor_small_worker_only"
