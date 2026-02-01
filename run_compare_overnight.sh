@@ -2,8 +2,8 @@
 set -euo pipefail
 
 DATA_PATH=${1:-data/sudoku-test-50-aug-5}
-EPOCHS=${2:-200}
-EVAL_INTERVAL=${3:-50}
+EPOCHS=${2:-1000}
+EVAL_INTERVAL=${3:-200}
 shift $(( $# > 3 ? 3 : $# )) || true
 EXTRA_ARGS=("$@")
 
